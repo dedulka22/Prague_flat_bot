@@ -1,0 +1,18 @@
+services:
+  flat-hunter-bot:
+    build: .
+    container_name: prague-flat-hunter
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - bot-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bot-data:
+    driver: local
