@@ -21,6 +21,7 @@ from config import config
 from database import Database, Listing
 from dedup import deduplicate_listings
 from scrapers import ALL_SCRAPERS
+from scrapers.base import HEADERS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,14 +110,76 @@ def format_user_filters(settings: dict) -> str:
     )
 
 
+# ─── Detail fetching ───────────────────────────────────────────
+
+async def fetch_listing_detail_text(session: aiohttp.ClientSession, url: str) -> str:
+    """Stiahne detail stránku inzerátu a vráti čistý text na kontrolu kľúčových slov."""
+    try:
+        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return ""
+            html = await resp.text()
+            # Odstráňme HTML tagy — chceme len text
+            import re as _re
+            text = _re.sub(r"<[^>]+>", " ", html)
+            text = _re.sub(r"\s+", " ", text)
+            return text.lower()
+    except Exception as e:
+        logger.debug(f"Detail fetch error ({url}): {e}")
+        return ""
+
+
+async def enrich_and_filter(session: aiohttp.ClientSession, listing: Listing) -> tuple[Listing | None, str]:
+    """
+    Stiahne detail inzerátu, skontroluje kľúčové slová.
+    Vráti (listing, "") ak je OK, alebo (None, dôvod) ak má byť filtrovaný.
+    """
+    # Najprv skontroluj to čo už máme (rýchle)
+    unwanted, reason = is_unwanted_listing(listing)
+    if unwanted:
+        return None, reason
+
+    # Stiahni detail a skontroluj celý text stránky
+    detail_text = await fetch_listing_detail_text(session, listing.url)
+    if detail_text:
+        # Pridaj detail text do dočasného objektu na kontrolu
+        enriched = Listing(
+            source=listing.source,
+            external_id=listing.external_id,
+            title=listing.title,
+            price=listing.price,
+            rooms=listing.rooms,
+            area_m2=listing.area_m2,
+            district=listing.district,
+            address=listing.address,
+            url=listing.url,
+            image_url=listing.image_url,
+            description=detail_text[:2000],  # prvých 2000 znakov stačí
+        )
+        unwanted, reason = is_unwanted_listing(enriched)
+        if unwanted:
+            return None, reason
+
+    return listing, ""
+
+
 # ─── Scraping ──────────────────────────────────────────────────
 
+DETAIL_SEMAPHORE = asyncio.Semaphore(5)  # max 5 paralelných detail fetchov
+
+
+async def enrich_with_semaphore(session, listing):
+    async with DETAIL_SEMAPHORE:
+        result = await enrich_and_filter(session, listing)
+        await asyncio.sleep(0.3)  # jemný rate limit
+        return result
+
+
 async def run_scrape_cycle() -> list[Listing]:
-    """Scrape all portals and save globally. Returns all newly found listings."""
+    """Scrape all portals, fetch details, filter unwanted, save globally."""
     all_new = []
 
     async with aiohttp.ClientSession() as session:
-        # Use global config for scraping (broadest possible range)
         for ScraperClass in ALL_SCRAPERS:
             scraper = ScraperClass(
                 min_price=config.min_price,
@@ -125,17 +188,28 @@ async def run_scrape_cycle() -> list[Listing]:
             )
             try:
                 found = await scraper.safe_scrape(session)
+
+                # Filtruj len nové (ešte neuložené) inzeráty — detail fetchujeme len pre ne
+                candidates = [l for l in found if not db.listing_exists(l)]
+
+                if candidates:
+                    logger.info(f"  {scraper.name}: {len(candidates)} nových kandidátov, sťahujem detaily...")
+                    tasks = [enrich_with_semaphore(session, l) for l in candidates]
+                    results = await asyncio.gather(*tasks)
+                else:
+                    results = []
+
                 new_count = 0
                 filtered_count = 0
-                for listing in found:
-                    unwanted, reason = is_unwanted_listing(listing)
-                    if unwanted:
-                        logger.info(f"  🚫 Preskočený [{scraper.name}]: {listing.title[:50]} — {reason}")
+                for result, reason in results:
+                    if result is None:
+                        logger.info(f"  🚫 Filtrovaný [{scraper.name}]: {reason}")
                         filtered_count += 1
                         continue
-                    if db.save_listing(listing):
-                        all_new.append(listing)
+                    if db.save_listing(result):
+                        all_new.append(result)
                         new_count += 1
+
                 db.log_scrape(scraper.name, "ok", len(found), new_count)
                 filter_note = f", 🚫 {filtered_count} filtrovaných" if filtered_count else ""
                 logger.info(f"  {scraper.name}: {len(found)} nájdených, {new_count} nových{filter_note}")

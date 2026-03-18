@@ -147,6 +147,14 @@ class Database:
 
     # ─── Listings ───────────────────────────────────────────────
 
+    def listing_exists(self, listing: Listing) -> bool:
+        """Skontroluje či inzerát už existuje v DB (bez uloženia)."""
+        cursor = self.conn.execute(
+            "SELECT 1 FROM listings WHERE source = ? AND external_id = ?",
+            (listing.source, listing.external_id)
+        )
+        return cursor.fetchone() is not None
+
     def save_listing(self, listing: Listing) -> bool:
         try:
             self.conn.execute(
