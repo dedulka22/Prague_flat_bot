@@ -16,40 +16,41 @@ class BazosScraper(BaseScraper):
     name = "bazos"
 
     def _build_url(self) -> str:
-        # Bazos URL: /prodam/byt/praha/
-        # Search filter via query: cena-od, cena-do
-        return f"{BASE_URL}/prodam/byt/praha/?hletefekt=1&hledession=&cession=&cena_od={self.min_price}&cena_do={self.max_price}"
+        # Opravená URL – Bazos zmenil štruktúru
+        return (
+            f"{BASE_URL}/byty/prodam/praha/"
+            f"?cena_od={self.min_price}&cena_do={self.max_price}"
+        )
 
     async def scrape(self, session: aiohttp.ClientSession) -> list[Listing]:
-        listings = []
         url = self._build_url()
-
-        async with session.get(url, headers=HEADERS) as resp:
-            if resp.status != 200:
-                logger.warning(f"Bazos HTTP {resp.status}")
-                return []
-
-            html = await resp.text()
-            listings = self._parse_html(html)
-
-        return listings
+        try:
+            async with session.get(url, headers=HEADERS, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Bazos HTTP {resp.status} (url: {url})")
+                    return []
+                html = await resp.text()
+                return self._parse_html(html)
+        except Exception as e:
+            logger.warning(f"Bazos error: {e}")
+            return []
 
     def _parse_html(self, html: str) -> list[Listing]:
         soup = BeautifulSoup(html, "html.parser")
         listings = []
 
-        # Bazos uses .inzeraty for listing containers
-        items = soup.select(".inzeraty, .inzerat, [class*='inzer']")
-
-        # Fallback: try common listing patterns
+        # Bazos listing containers
+        items = soup.select(".inzeraty .inzerat")
         if not items:
-            items = soup.select(".maincontent .vypis, .list .item")
+            items = soup.select(".inzerat")
+        if not items:
+            # Fallback – hľadáme podľa štruktúry
+            items = soup.select("div[class*='inzer']")
 
         for item in items:
             try:
                 listing = self._parse_item(item)
                 if listing:
-                    # Filter by rooms if possible
                     if listing.rooms and not self.matches_rooms(listing.rooms):
                         continue
                     listings.append(listing)
@@ -59,8 +60,7 @@ class BazosScraper(BaseScraper):
         return listings
 
     def _parse_item(self, item) -> Listing | None:
-        # Find title/link
-        link_el = item.select_one("a[href*='/inzerat/'], a.nadpis, h2 a, h3 a")
+        link_el = item.select_one("a.nadpis, h2 a, h3 a, a[href*='/inzerat/']")
         if not link_el:
             link_el = item.select_one("a")
         if not link_el:
@@ -74,38 +74,28 @@ class BazosScraper(BaseScraper):
 
         title = link_el.get_text(strip=True)
 
-        # Extract ID from URL
         id_match = re.search(r"/inzerat/(\d+)", href)
         external_id = id_match.group(1) if id_match else str(hash(href))
 
-        # Price
         price = 0
         price_el = item.select_one(".inzeratycena, [class*='cena']")
         if price_el:
-            price_text = price_el.get_text(strip=True)
-            price = self._parse_price(price_text) or 0
+            price = self._parse_price(price_el.get_text(strip=True)) or 0
 
         if price and (price < self.min_price or price > self.max_price):
             return None
 
-        # Try to extract rooms from title
-        rooms = self._extract_rooms(title)
-
-        # Description / text content
-        desc_el = item.select_one(".inzeratypopis, .popis, [class*='popis']")
+        desc_el = item.select_one(".inzeratypopis, [class*='popis']")
         description = desc_el.get_text(strip=True) if desc_el else ""
 
-        if not rooms:
-            rooms = self._extract_rooms(description)
+        rooms = self._extract_rooms(title) or self._extract_rooms(description)
 
-        # Image
         img_el = item.select_one("img")
         image_url = img_el.get("src", "") if img_el else None
         if image_url and not image_url.startswith("http"):
             image_url = f"https://reality.bazos.cz{image_url}"
 
-        # Location
-        locality_el = item.select_one(".inzeratylok, [class*='lokalita']")
+        locality_el = item.select_one(".inzeratylok, [class*='lokalit']")
         address = locality_el.get_text(strip=True) if locality_el else ""
 
         district = ""
@@ -114,7 +104,6 @@ class BazosScraper(BaseScraper):
         if praha_match:
             district = praha_match.group(0)
 
-        # Area
         area = None
         area_match = re.search(r"(\d+)\s*m[²2]", full_text)
         if area_match:

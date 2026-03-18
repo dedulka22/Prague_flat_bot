@@ -32,6 +32,41 @@ logger = logging.getLogger("bot")
 db = Database(config.db_path)
 
 
+# ─── Filter: Družstevné byty a anuita ─────────────────────────
+
+DRUZSTVO_KEYWORDS = [
+    "družstevní", "družstevn", "družstvo", "členský podíl", "členský podil",
+    "převod členských práv", "bytové družstvo", "bytove druzstvo",
+    "podíl v družstvu", "podil v druzstvu",
+]
+
+ANUITA_KEYWORDS = [
+    "anuita", "anuitní", "zástavní právo", "zástavní právo", "záložní právo",
+    "zalozni pravo", "věcné břemeno", "vecne bremeno",
+    "hypoteční zástavní", "exekuce", "exekuční", "insolvence", "insolvenční",
+    "dražba", "předkupní právo zástavního",
+]
+
+
+def is_unwanted_listing(listing: Listing) -> tuple[bool, str]:
+    """Vráti (True, dôvod) ak je byt družstevný alebo má anuitu/záložné právo."""
+    check_text = " ".join(filter(None, [
+        listing.title,
+        listing.description,
+        listing.address,
+    ])).lower()
+
+    for kw in DRUZSTVO_KEYWORDS:
+        if kw.lower() in check_text:
+            return True, f"družstevní ({kw})"
+
+    for kw in ANUITA_KEYWORDS:
+        if kw.lower() in check_text:
+            return True, f"anuita/záložní právo ({kw})"
+
+    return False, ""
+
+
 # ─── Formatting ────────────────────────────────────────────────
 
 def format_listing_message(listing: Listing) -> str:
@@ -91,12 +126,19 @@ async def run_scrape_cycle() -> list[Listing]:
             try:
                 found = await scraper.safe_scrape(session)
                 new_count = 0
+                filtered_count = 0
                 for listing in found:
+                    unwanted, reason = is_unwanted_listing(listing)
+                    if unwanted:
+                        logger.info(f"  🚫 Preskočený [{scraper.name}]: {listing.title[:50]} — {reason}")
+                        filtered_count += 1
+                        continue
                     if db.save_listing(listing):
                         all_new.append(listing)
                         new_count += 1
                 db.log_scrape(scraper.name, "ok", len(found), new_count)
-                logger.info(f"  {scraper.name}: {len(found)} nájdených, {new_count} nových")
+                filter_note = f", 🚫 {filtered_count} filtrovaných" if filtered_count else ""
+                logger.info(f"  {scraper.name}: {len(found)} nájdených, {new_count} nových{filter_note}")
             except Exception as e:
                 logger.error(f"  {scraper.name} error: {e}")
                 db.log_scrape(scraper.name, "error", error=str(e))
